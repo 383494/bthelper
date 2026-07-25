@@ -19,6 +19,8 @@ limitations under the License.
 #include <string_view>
 #include <functional>
 #include <vector>
+#include <string>
+#include <string_view>
 
 typedef std::basic_string_view<unsigned char> ustring_view;
 

@@ -20,6 +20,52 @@ PKG_PROG_PKG_CONFIG
 AC_LANG_CPLUSPLUS
 AC_CHECK_LIB([util], [forkpty])
 
+# Add -std=c++17 iff needed.
+AC_LANG_PUSH([C++])
+AC_MSG_CHECKING([whether std::string_view works by default])
+AC_COMPILE_IFELSE(
+    [AC_LANG_PROGRAM(
+        [[#include <string_view>]],
+        [[
+            std::string_view s = "test";
+            return s.size() != 4;
+        ]]
+    )],
+    [
+        AC_MSG_RESULT([yes])
+    ],
+    [
+        AC_MSG_RESULT([no])
+
+        save_CXXFLAGS=$CXXFLAGS
+        CXXFLAGS="$CXXFLAGS -std=c++17"
+
+        AC_MSG_CHECKING([whether std::string_view works with -std=c++17])
+        AC_COMPILE_IFELSE(
+            [AC_LANG_PROGRAM(
+                [[#include <string_view>]],
+                [[
+                    std::string_view s = "test";
+                    return s.size() != 4;
+                ]]
+            )],
+            [
+                AC_MSG_RESULT([yes])
+                dnl Keep -std=c++17 in CXXFLAGS.
+            ],
+            [
+                AC_MSG_RESULT([no])
+                CXXFLAGS=$save_CXXFLAGS
+                AC_MSG_ERROR(
+                    [a compiler and standard library supporting std::string_view are required]
+                )
+            ]
+        )
+    ]
+)
+
+AC_LANG_POP([C++])
+
 # Output
 AC_CONFIG_FILES([Makefile])
 AC_OUTPUT
