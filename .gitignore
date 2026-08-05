@@ -22,4 +22,5 @@ config.h
 stamp-h1
 bt-listener
 bt-connecter
+m4/
 *.swp
