@@ -19,6 +19,10 @@ limitations under the License.
 #include <string_view>
 #include <functional>
 #include <vector>
+#include <string>
+#include <string_view>
+
+typedef std::basic_string_view<unsigned char> ustring_view;
 
 class Buffer
 {
@@ -33,39 +37,39 @@ public:
     Buffer(Buffer&&) = default;
     Buffer& operator=(Buffer&&) = default;
 
-    virtual void write(std::string_view sv) = 0;
+    virtual void write(ustring_view sv) = 0;
 
-    void write(const std::vector<char>& in)
+    void write(const std::vector<uint8_t>& in)
     {
-        write(std::string_view(in.data(), in.size()));
+        write(ustring_view(in.data(), in.size()));
     }
 
     // Invalidated on any non-const
-    virtual std::string_view peek() const = 0;
+    [[nodiscard]] virtual ustring_view peek() const = 0;
 
     virtual void ack(size_t n) = 0;
 
-    bool empty() const { return peek().empty(); }
+    [[nodiscard]] bool empty() const { return peek().empty(); }
 };
 
 class RawBuffer : public Buffer
 {
 public:
-    void write(std::string_view sv) override;
-    std::string_view peek() const override;
+    void write(ustring_view sv) override;
+    [[nodiscard]] ustring_view peek() const override;
     void ack(size_t n) override;
 
 private:
     // TODO: optimization opportunity: partial consumtion of data could
     // contain an offset into the buffer.
-    std::vector<char> data_;
+    std::vector<uint8_t> data_;
 };
 
 class TelnetEncoderBuffer : public Buffer
 {
 public:
-    void write(std::string_view sv) override;
-    std::string_view peek() const override;
+    void write(ustring_view sv) override;
+    [[nodiscard]] ustring_view peek() const override;
     void ack(size_t n) override;
 
     void ping(uint32_t cookie);
@@ -73,7 +77,7 @@ public:
     void window_size(uint16_t rows, uint16_t cols);
 
 private:
-    std::vector<char> data_;
+    std::vector<uint8_t> data_;
 };
 
 class TelnetDecoderBuffer : public Buffer
@@ -88,15 +92,15 @@ public:
     {
     }
 
-    void write(std::string_view sv) override;
-    std::string_view peek() const override;
+    void write(ustring_view sv) override;
+    [[nodiscard]] ustring_view peek() const override;
     void ack(size_t n) override;
 
 private:
+    window_size_handler_t winch_;
     ping_handler_t ping_;
     ping_handler_t pong_;
-    window_size_handler_t winch_;
-    std::vector<char> data_;
-    std::vector<char> iac_buffer_;
+    std::vector<uint8_t> data_;
+    std::vector<uint8_t> iac_buffer_;
 };
 #endif

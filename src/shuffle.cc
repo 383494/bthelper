@@ -22,9 +22,10 @@ limitations under the License.
 #include <iostream>
 #include <algorithm>
 #include <stdexcept>
+#include <sys/select.h>
 
 namespace {
-bool set_nonblock(int fd)
+[[nodiscard]] bool set_nonblock(int fd)
 {
     const int flags = fcntl(fd, F_GETFL, 0);
     if (flags < 0) {
@@ -38,32 +39,42 @@ bool set_nonblock(int fd)
     return true;
 }
 
-std::string do_read(int fd)
+[[nodiscard]] std::vector<uint8_t> do_read(int fd)
 {
-    constexpr size_t read_size = 128;
-    std::vector<char> ret(read_size);
-    const auto s = read(fd, ret.data(), ret.size());
-    if (s < 0) {
-        throw std::system_error(errno, std::generic_category(), "read()");
+    constexpr size_t read_size = 64 * 1024;
+    std::vector<uint8_t> ret(read_size);
+    for (;;) {
+        const auto s = read(fd, ret.data(), ret.size());
+        if (s < 0) {
+            if (errno == EAGAIN || errno == EINTR) {
+                continue;
+            }
+            throw std::system_error(errno, std::generic_category(), "read()");
+        }
+        ret.resize(static_cast<size_t>(s));
+        return ret;
     }
-    ret.resize(s);
-    return { ret.begin(), ret.end() };
 }
 
-size_t do_write(int fd, const std::string_view data)
+[[nodiscard]] size_t do_write(int fd, const ustring_view data)
 {
-    const auto rc = write(fd, data.data(), data.size());
-    if (rc < 0) {
-        throw std::system_error(errno, std::generic_category(), "write()");
+    for (;;) {
+        const auto rc = write(fd, data.data(), data.size());
+        if (rc < 0) {
+            if (errno == EAGAIN || errno == EINTR) {
+                continue;
+            }
+            throw std::system_error(errno, std::generic_category(), "write()");
+        }
+        return static_cast<size_t>(rc);
     }
-    return rc;
 }
 } // namespace
 
-void Shuffler::copy(int src, int dst, std::unique_ptr<Buffer>&& buf, int esc)
+void Shuffler::copy(int src, int dst, std::shared_ptr<Buffer> buf, std::optional<uint8_t> esc)
 {
     if (!buf) {
-        buf = std::make_unique<RawBuffer>();
+        buf = std::make_shared<RawBuffer>();
     }
     streams_.emplace_back(src, dst, std::move(buf), esc);
 }
@@ -77,7 +88,9 @@ void Shuffler::run()
 {
     // Set nonblock.
     for (const auto& s : streams_) {
-        set_nonblock(s.src());
+        if (!set_nonblock(s.src())) {
+            throw std::runtime_error("Unable to set nonblocking mode");
+        }
     }
 
     // Event loop.
@@ -115,6 +128,9 @@ void Shuffler::run()
         // select()
         const auto rc = select(mx + 1, &rfds, &wfds, &efds, NULL);
         if (rc < 0) {
+            if (errno == EAGAIN || errno == EINTR) {
+                continue;
+            }
             throw std::system_error(errno, std::generic_category(), "select()");
         }
 
@@ -126,10 +142,10 @@ void Shuffler::run()
         }
 
         // Check for errors.
-        for (int c = 0; c < streams_.size();) {
+        for (size_t c = 0; c < streams_.size();) {
             auto& s = streams_[c];
             if (FD_ISSET(s.src(), &efds) || FD_ISSET(s.dst(), &efds)) {
-                streams_.erase(streams_.begin() + c);
+                streams_.erase(streams_.begin() + static_cast<ssize_t>(c));
                 continue;
             }
             c++;
@@ -143,37 +159,38 @@ void Shuffler::run()
         }
 
         // Read.
-        for (int c = 0; c < streams_.size();) {
+        for (size_t c = 0; c < streams_.size();) {
             auto& s = streams_[c];
 
             if (FD_ISSET(s.src(), &rfds)) {
                 auto buf = do_read(s.src());
                 if (buf.empty()) {
-                    streams_.erase(streams_.begin() + c);
-                    continue;
-                }
-                s.write(buf);
-                if (s.check_esc()) {
                     return;
                 }
+                if (s.check_esc(buf)) {
+                    return;
+                }
+                s.write(buf);
             }
             c++;
         }
     }
 }
 
-Shuffler::Stream::Stream(int src, int dst, std::unique_ptr<Buffer>&& buf, int esc)
+Shuffler::Stream::Stream(int src, int dst, std::shared_ptr<Buffer> buf, std::optional<uint8_t> esc)
     : src_(src), dst_(dst), buf_(std::move(buf)), esc_(esc)
 {
 }
 
-bool Shuffler::Stream::check_esc()
+bool Shuffler::Stream::check_esc(const std::vector<uint8_t>& input) const
 {
-    if (esc_ < 0) {
+    if (!esc_.has_value()) {
         return false;
     }
-    auto b = buf_->peek();
-    return std::find(b.begin(), b.end(), esc_) != b.end();
+    const auto esc = esc_.value();
+    return std::any_of(input.begin(), input.end(), [esc](char ch) {
+        return static_cast<uint8_t>(ch) == esc;
+    });
 }
 
 #if 0
@@ -185,3 +202,6 @@ int main()
     shuf.run();
 }
 #endif
+/*
+ * vim: ts=4 sw=4
+ */

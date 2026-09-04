@@ -41,6 +41,7 @@ struct termios orig_tio;
 sig_atomic_t reset_terminal = 0;
 constexpr uint8_t escape = 0x1d; // ^]
 
+[[noreturn]]
 void usage(const char* av0, int err)
 {
     fprintf(stderr,
@@ -53,18 +54,17 @@ void usage(const char* av0, int err)
     exit(err);
 }
 
-int setup_signalfd()
+[[nodiscard]] int setup_signalfd()
 {
     sigset_t mask;
     sigemptyset(&mask);
     sigaddset(&mask, SIGWINCH);
+    if (-1 == sigprocmask(SIG_BLOCK, &mask, nullptr)) {
+        throw std::system_error(errno, std::generic_category(), "sigprocmask()");
+    }
     const int fd = signalfd(-1, &mask, SFD_NONBLOCK);
     if (-1 == fd) {
         throw std::system_error(errno, std::generic_category(), "signalfd()");
-    }
-    if (-1 == sigprocmask(SIG_BLOCK, &mask, nullptr)) {
-        close(fd);
-        throw std::system_error(errno, std::generic_category(), "sigprocmask()");
     }
     return fd;
 }
@@ -90,8 +90,12 @@ void send_window(int terminal, TelnetEncoderBuffer* buf)
 void set_raw_terminal(int terminal)
 {
     struct termios tio;
+    if (tcgetattr(terminal, &tio))
+        throw std::system_error(errno, std::generic_category(), "tcgetattr()");
+    orig_tio = tio;
+    reset_terminal = 1;
     cfmakeraw(&tio);
-    tio.c_lflag &= ~ECHO;
+    tio.c_lflag &= (tcflag_t)~ECHO;
     if (tcsetattr(terminal, TCSADRAIN, &tio)) {
         throw std::system_error(
             errno, std::generic_category(), "tcsetattr(raw minus echo)");
@@ -100,7 +104,7 @@ void set_raw_terminal(int terminal)
 
 } // namespace
 
-int wrapmain(int argc, char** argv)
+[[nodiscard]] int wrapmain(int argc, char** argv)
 {
     bool do_terminal = false;
     {
@@ -126,14 +130,20 @@ int wrapmain(int argc, char** argv)
     // Args.
     const std::string addrs = argv[optind];
     const std::string chans = argv[optind + 1];
-    int channel;
+    uint8_t channel;
     {
         const auto ch_ok = xatoi(chans.c_str());
         if (!ch_ok.second) {
             fprintf(stderr, "Unable to parse channel number: %s\n", chans.c_str());
             exit(EXIT_FAILURE);
         }
-        channel = ch_ok.first;
+        // TODO: should be something like 30, but mostly we're checking that it
+        // fits in uint8_t.
+        if (ch_ok.first > 60 || ch_ok.first < 0) {
+            fprintf(stderr, "Channel number out of range: %s\n", chans.c_str());
+            exit(EXIT_FAILURE);
+        }
+        channel = (uint8_t)ch_ok.first;
     }
 
     int sock = socket(AF_BLUETOOTH, SOCK_STREAM, BTPROTO_RFCOMM);
@@ -165,22 +175,25 @@ int wrapmain(int argc, char** argv)
     Shuffler shuf;
 
     if (do_terminal) {
-        auto txbuf = std::make_unique<TelnetEncoderBuffer>();
+        auto txbuf = std::make_shared<TelnetEncoderBuffer>();
+        auto sigfd = setup_signalfd();
         send_window(STDIN_FILENO, txbuf.get());
 
-        auto sigfd = setup_signalfd();
-        shuf.watch(sigfd, [sigfd, txbuf = txbuf.get()](int) {
-            send_window(STDIN_FILENO, txbuf);
+        const std::weak_ptr<TelnetEncoderBuffer> weak_txbuf = txbuf;
+        shuf.watch(sigfd, [sigfd, weak_txbuf](int) {
             struct signalfd_siginfo tmp;
             if (-1 == read(sigfd, &tmp, sizeof tmp)) {
                 perror("read(signalfd)");
+            }
+            if (const auto buf = weak_txbuf.lock()) {
+                send_window(STDIN_FILENO, buf.get());
             }
         });
 
         signal(SIGINT, sigint_handler);
         set_raw_terminal(STDIN_FILENO);
 
-        // shuf.copy(sock, STDOUT_FILENO, std::make_unique<TelnetEncoderBuffer>());
+        // shuf.copy(sock, STDOUT_FILENO, std::make_shared<TelnetEncoderBuffer>());
         shuf.copy(sock, STDOUT_FILENO);
         shuf.copy(STDIN_FILENO, sock, std::move(txbuf), escape);
     } else {

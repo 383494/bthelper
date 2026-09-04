@@ -29,8 +29,10 @@ limitations under the License.
 #include <algorithm>
 #include <array>
 #include <cinttypes>
+#include <csignal>
 #include <cstring>
 #include <iostream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -43,6 +45,7 @@ const std::string escape_term = "{}";
 const std::string escape_addr = "{addr}";
 int verbose = 0;
 
+[[noreturn]]
 void usage(const char* av0, int err)
 {
     fprintf(
@@ -50,7 +53,7 @@ void usage(const char* av0, int err)
     exit(err);
 }
 
-std::pair<std::string, std::string> hostport_split(const std::string& in)
+[[nodiscard]] std::pair<std::string, std::string> hostport_split(const std::string& in)
 {
     const auto count = std::count(in.begin(), in.end(), ':');
     if (count == 0) {
@@ -79,7 +82,7 @@ std::pair<std::string, std::string> hostport_split(const std::string& in)
     return { host1.substr(1, host1.size() - 2), port };
 }
 
-int tcp_connect(const std::string& target)
+[[nodiscard]] int tcp_connect(const std::string& target)
 {
     const auto hostport = hostport_split(target);
     const auto host = hostport.first;
@@ -113,6 +116,7 @@ int tcp_connect(const std::string& target)
             sock = s;
             break;
         }
+        close(s);
     }
     freeaddrinfo(addrs);
     return sock;
@@ -120,7 +124,7 @@ int tcp_connect(const std::string& target)
 
 
 // ttyname() except with "/dev" stripped.
-std::string xttyname(int fd)
+[[nodiscard]] std::string xttyname(int fd)
 {
     char buf[PATH_MAX] = { 0 };
     const auto err = ttyname_r(fd, buf, sizeof buf);
@@ -136,17 +140,29 @@ std::string xttyname(int fd)
     return s;
 }
 
+namespace {
+struct FdCloser {
+    int fd;
+    ~FdCloser() { if (fd >= 0) close(fd); }
+    FdCloser(const FdCloser&) = delete;
+    FdCloser& operator=(const FdCloser&) = delete;
+};
+}
+
 void connection(int sock, std::string_view remote, const std::string& target)
 {
+    FdCloser sock_closer{ sock };
     int ar = STDIN_FILENO;
     int aw = STDOUT_FILENO;
+    FdCloser tcp_closer{ -1 };
 
     if (!target.empty()) {
         ar = aw = tcp_connect(target);
         if (ar == -1) {
-            std::cerr << "Failed to connect\n";
-            exit(1);
+            std::cerr << remote << " Failed to connect to target\n";
+            return;
         }
+        tcp_closer.fd = ar;
     }
     Shuffler shuf;
     shuf.copy(ar, sock);
@@ -156,7 +172,7 @@ void connection(int sock, std::string_view remote, const std::string& target)
         shuf.run();
     } catch (const std::system_error& e) {
         // Actually a normal way for the connection to end.
-        if (e.code() == std::errc::connection_reset) {
+        if (e.code() == std::errc::connection_reset || e.code() == std::errc::broken_pipe) {
             std::cerr << remote << " Disconnected\n";
         } else {
             throw;
@@ -164,7 +180,7 @@ void connection(int sock, std::string_view remote, const std::string& target)
     }
 }
 
-std::vector<const char*> exec_c_args(const std::vector<std::string>& in)
+[[nodiscard]] std::vector<const char*> exec_c_args(const std::vector<std::string>& in)
 {
     std::vector<const char*> ret;
     for (const auto& s : in) {
@@ -175,7 +191,7 @@ std::vector<const char*> exec_c_args(const std::vector<std::string>& in)
 }
 
 
-std::string subst(const std::string& from, const std::string& to, std::string s)
+[[nodiscard]] std::string subst(const std::string& from, const std::string& to, std::string s)
 {
     for (;;) {
         auto pos = s.find(from);
@@ -186,9 +202,9 @@ std::string subst(const std::string& from, const std::string& to, std::string s)
     }
 }
 
-std::vector<std::string> substitute_args(const std::vector<std::string>& in,
-                                         const std::string& term,
-                                         const std::string& addr)
+[[nodiscard]] std::vector<std::string> substitute_args(const std::vector<std::string>& in,
+                                                       const std::string& term,
+                                                       const std::string& addr)
 {
     std::vector<std::string> ret;
     for (const auto& s : in) {
@@ -197,13 +213,13 @@ std::vector<std::string> substitute_args(const std::vector<std::string>& in,
     return ret;
 }
 
-
+[[nodiscard]]
 int exec_child(const std::vector<std::string>& exec_args, const std::string& addr)
 {
     const auto tty = xttyname(0);
     const auto args = substitute_args(exec_args, tty, addr);
-    struct termios tio {
-    };
+    struct termios tio;
+    if (tcgetattr(0, &tio)) { perror("tcgetattr()"); exit(EXIT_FAILURE); }
     cfmakeraw(&tio);
     if (tcsetattr(0, TCSADRAIN, &tio)) {
         std::cerr << "tcsetattr(raw)\n";
@@ -211,19 +227,26 @@ int exec_child(const std::vector<std::string>& exec_args, const std::string& add
     }
 
     const auto cargs = exec_c_args(args);
+    if (signal(SIGPIPE, SIG_DFL) == SIG_ERR) {
+        perror("signal(SIGPIPE)");
+        return EXIT_FAILURE;
+    }
     execvp(cargs[0], const_cast<char* const*>(&cargs[0]));
     perror("exec()");
     return EXIT_FAILURE;
 }
 
 
-int handle_exec(int con,
-                std::string_view remote,
-                const std::vector<std::string>& exec_args,
-                const std::string& addr)
+[[nodiscard]] int handle_exec(int con,
+                              std::string_view remote,
+                              const std::vector<std::string>& exec_args,
+                              const std::string& addr)
 {
     int amaster;
-    const auto pid = forkpty(&amaster, NULL, NULL, NULL);
+    struct winsize initial_size {};
+    initial_size.ws_row = 24;
+    initial_size.ws_col = 80;
+    const auto pid = forkpty(&amaster, NULL, NULL, &initial_size);
     if (pid == -1) {
         perror("forkpty()");
         return EXIT_FAILURE;
@@ -231,9 +254,9 @@ int handle_exec(int con,
 
     if (!pid) {
         close(con);
-        exec_child(exec_args, addr);
+        exit(exec_child(exec_args, addr));
     }
-    auto rx = std::make_unique<TelnetDecoderBuffer>(
+    auto rx = std::make_shared<TelnetDecoderBuffer>(
         [amaster](uint16_t rows, uint16_t cols) {
             struct winsize ws {
             };
@@ -243,8 +266,8 @@ int handle_exec(int con,
                 perror("ioctl()");
             }
         },
-        [](uint32_t cookie) { std::cerr << "PING\n"; },
-        [](uint32_t cookie) { std::cerr << "PONG\n"; });
+        []([[maybe_unused]] uint32_t cookie) { std::cerr << "PING\n"; },
+        []([[maybe_unused]] uint32_t cookie) { std::cerr << "PONG\n"; });
 
     Shuffler shuf;
     shuf.copy(amaster, con);
@@ -253,13 +276,15 @@ int handle_exec(int con,
         shuf.run();
     } catch (const std::system_error& e) {
         // Actually a normal way for the connection to end, apparently.
-        if (e.code() == std::errc::connection_reset) {
+        if (e.code() == std::errc::connection_reset || e.code() == std::errc::broken_pipe) {
             std::cerr << remote << " Disconnected\n";
         } else if (e.code() == std::errc::io_error) {
             std::cerr << remote << " Terminal closed\n";
         } else {
             throw;
         }
+    } catch (const std::runtime_error& e) {
+        std::cerr << remote << " Invalid terminal protocol: " << e.what() << "\n";
     }
     close(con);
     close(amaster);
@@ -287,7 +312,7 @@ int handle_exec(int con,
 
 } // namespace
 
-int wrapmain(int argc, char** argv)
+[[nodiscard]] int wrapmain(int argc, char** argv)
 {
     int channel = -1;
     std::string target;
@@ -347,13 +372,13 @@ int wrapmain(int argc, char** argv)
         exit(EXIT_FAILURE);
     }
 
-    int sock = socket(AF_BLUETOOTH, SOCK_STREAM, BTPROTO_RFCOMM);
+    int sock = socket(AF_BLUETOOTH, SOCK_STREAM | SOCK_CLOEXEC, BTPROTO_RFCOMM);
 
     // Bind to zeroes.
     struct sockaddr_rc laddr {
     };
     laddr.rc_family = AF_BLUETOOTH;
-    laddr.rc_channel = channel;
+    laddr.rc_channel = static_cast<uint8_t>(channel); // Checked elsewhere.
     if (bind(sock, reinterpret_cast<sockaddr*>(&laddr), sizeof(laddr))) {
         perror("Failed to bind");
         close(sock);
@@ -372,6 +397,12 @@ int wrapmain(int argc, char** argv)
         };
         socklen_t socklen = sizeof(raddr);
         const int con = accept(sock, reinterpret_cast<sockaddr*>(&raddr), &socklen);
+        if (con < 0) {
+            std::cerr << "accept() failed: " << strerror(errno) << "\n";
+            // Prevent busyloop.
+            sleep(1);
+            continue;
+        }
         const auto remote = stringify_addr(&raddr.rc_bdaddr);
         if (verbose) {
             std::cerr << remote << " Client connected\n";
@@ -379,7 +410,7 @@ int wrapmain(int argc, char** argv)
         // TODO: log remote address
         // TODO: fork.
         if (do_exec) {
-            handle_exec(con, remote, exec_args, remote);
+            static_cast<void>(handle_exec(con, remote, exec_args, remote));
         } else {
             connection(con, remote, target);
         }
